@@ -111,6 +111,7 @@ export default function TweetForm() {
     setIsSubmitting(true);
     setResult(null);
     setValidationError(null);
+    setError(null);
 
     // Validate message
     if (!message.trim()) {
@@ -136,8 +137,6 @@ export default function TweetForm() {
         ...(scheduleTime && { scheduleTime: new Date(scheduleTime).toISOString() })
       };
 
-      console.log('Sending tweet request with payload:', payload);
-
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
@@ -147,14 +146,14 @@ export default function TweetForm() {
         body: JSON.stringify(payload),
       });
 
-      console.log('Response status:', response.status);
       const data = await response.json();
-      console.log('Response data:', data);
       
       if (response.status === 429) {
         const resetTime = data.resetTime;
-        const waitTime = resetTime ? Math.ceil((resetTime - Date.now()) / 1000) : 900; // Default to 15 minutes
-        throw new Error(`Rate limit exceeded. Please wait ${Math.ceil(waitTime / 60)} minutes before trying again.`);
+        const waitMinutes = Math.ceil((resetTime - Date.now()) / (60 * 1000));
+        setError(`Rate limit exceeded. Please wait ${waitMinutes} minutes before trying again.`);
+        setIsSubmitting(false);
+        return;
       }
 
       if (!response.ok) {
@@ -166,16 +165,14 @@ export default function TweetForm() {
       if (data.success) {
         setMessage('');
         setScheduleTime('');
+        setSuccess('Tweet posted successfully!');
         if (data.scheduled) {
           fetchScheduledTweets();
         }
       }
     } catch (error: any) {
       console.error('Tweet posting error:', error);
-      setResult({ 
-        success: false, 
-        error: error.message || 'Failed to connect to the server. Please check your internet connection and try again.' 
-      });
+      setError(error.message || 'Failed to post tweet');
     } finally {
       setIsSubmitting(false);
     }

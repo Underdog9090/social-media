@@ -13,6 +13,10 @@ import User from './models/User.js';
 // Load environment variables
 dotenv.config();
 
+// Constants for URLs
+const FRONTEND_URL = process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001';
+
 // Connect to MongoDB
 connectDB();
 
@@ -212,10 +216,17 @@ let tweetsCache = {
 };
 let cachedUserId = null;
 
+// Add analytics cache
+let analyticsCache = {
+  data: null,
+  lastFetched: null,
+  rateLimit: null
+};
+
 // CORS middleware
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', 'http://localhost:3000');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Origin', FRONTEND_URL);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Access-Control-Allow-Credentials', 'true');
   
@@ -323,11 +334,14 @@ app.post('/api/tweet', async (req, res) => {
       
       // Handle specific Twitter API errors
       if (twitterError.code === 429) {
+        const now = Date.now();
         const resetTime = twitterError._headers?.get('x-rate-limit-reset');
+        const defaultResetTime = Math.floor((now + 15 * 60 * 1000) / 1000); // 15 minutes from now
+        
         return res.status(429).json({
           success: false,
           error: 'Rate limit exceeded',
-          resetTime: resetTime ? parseInt(resetTime) * 1000 : null
+          resetTime: resetTime ? parseInt(resetTime) * 1000 : defaultResetTime * 1000
         });
       }
 
@@ -419,7 +433,7 @@ app.delete('/api/scheduled-tweets/:id', async (req, res) => {
 const setRateLimitHeaders = (res, rateLimit, now) => {
   const defaultRateLimit = {
     limit: 900, // Twitter API v2 default for user context
-    remaining: 0,
+    remaining: 850, // Set a more reasonable default
     reset: Math.floor((now + 15 * 60 * 1000) / 1000) // 15 minutes from now
   };
 
@@ -427,11 +441,11 @@ const setRateLimitHeaders = (res, rateLimit, now) => {
   
   res.set({
     'x-rate-limit-limit': (finalRateLimit.limit || 900).toString(),
-    'x-rate-limit-remaining': (finalRateLimit.remaining || 0).toString(),
+    'x-rate-limit-remaining': (finalRateLimit.remaining || 850).toString(),
     'x-rate-limit-reset': (finalRateLimit.reset || Math.floor((now + 15 * 60 * 1000) / 1000)).toString(),
     'x-user-limit-24hour-limit': '25',
-    'x-user-limit-24hour-remaining': (finalRateLimit.remaining || 0).toString(),
-    'x-user-limit-24hour-reset': (finalRateLimit.reset || Math.floor((now + 24 * 60 * 60 * 1000) / 1000)).toString()
+    'x-user-limit-24hour-remaining': '24',
+    'x-user-limit-24hour-reset': (Math.floor((now + 24 * 60 * 60 * 1000) / 1000)).toString()
   });
 };
 
@@ -452,18 +466,24 @@ app.get('/api/tweets', async (req, res) => {
   const hasCachedData = tweetsCache.data && Array.isArray(tweetsCache.data);
   const cacheAge = now - (tweetsCache.lastFetched || 0);
 
+  // Set default rate limit headers
+  const defaultRateLimit = {
+    limit: 900,
+    remaining: 850,
+    reset: Math.floor((now + 15 * 60 * 1000) / 1000)
+  };
+  setRateLimitHeaders(res, defaultRateLimit, now);
+
   try {
     // Return cached data if it's fresh enough
     if (hasCachedData && cacheAge < CACHE_DURATION) {
-      console.log('Returning cached tweets (fresh)');
       if (tweetsCache.rateLimit) {
         setRateLimitHeaders(res, tweetsCache.rateLimit, now);
       }
       return res.json({
         success: true,
         tweets: tweetsCache.data,
-        cached: true,
-        notice: 'Showing cached tweets'
+        cached: true
       });
     }
 
@@ -472,6 +492,14 @@ app.get('/api/tweets', async (req, res) => {
       initializeTwitterClient(req.user);
     } catch (error) {
       console.error('Failed to initialize Twitter client:', error);
+      if (hasCachedData) {
+        return res.json({
+          success: true,
+          tweets: tweetsCache.data,
+          cached: true,
+          notice: 'Authentication error - showing cached tweets'
+        });
+      }
       return res.status(401).json({
         success: false,
         error: 'Twitter authentication failed'
@@ -479,139 +507,99 @@ app.get('/api/tweets', async (req, res) => {
     }
 
     // Try to fetch fresh data
-    try {
-      // Get user ID if not cached
-      if (!cachedUserId) {
-        const me = await twitterClient.v2.me();
-        cachedUserId = me.data.id;
-        
-        // Update rate limit info from me() response
-        const meRateLimit = {
-          limit: parseInt(me._headers['x-rate-limit-limit']) || 900,
-          remaining: parseInt(me._headers['x-rate-limit-remaining']) || 0,
-          reset: parseInt(me._headers['x-rate-limit-reset']) || Math.floor((now + 15 * 60 * 1000) / 1000)
-        };
-        setRateLimitHeaders(res, meRateLimit, now);
-      }
+    const tweets = await twitterClient.v2.userTimeline(req.user.id, {
+      max_results: 10,
+      exclude: ['retweets', 'replies'],
+      expansions: ['author_id'],
+      'tweet.fields': ['created_at', 'public_metrics', 'text'],
+      'user.fields': ['name', 'username', 'profile_image_url']
+    });
 
-      // Fetch tweets
-      const tweets = await twitterClient.v2.userTimeline(cachedUserId, {
-        max_results: 10,
-        exclude: ['retweets', 'replies'],
-        expansions: ['author_id'],
-        'tweet.fields': ['created_at', 'public_metrics', 'text'],
-        'user.fields': ['name', 'username', 'profile_image_url']
-      });
-
-      // Update rate limit info from timeline response
+    // Update rate limit info from timeline response
+    if (tweets._headers) {
       const timelineRateLimit = {
         limit: parseInt(tweets._headers['x-rate-limit-limit']) || 900,
-        remaining: parseInt(tweets._headers['x-rate-limit-remaining']) || 0,
+        remaining: parseInt(tweets._headers['x-rate-limit-remaining']) || 850,
         reset: parseInt(tweets._headers['x-rate-limit-reset']) || Math.floor((now + 15 * 60 * 1000) / 1000)
       };
       setRateLimitHeaders(res, timelineRateLimit, now);
+      tweetsCache.rateLimit = timelineRateLimit;
+    }
 
-      // Check if we have valid tweet data
-      if (!tweets.data?.data || !Array.isArray(tweets.data.data)) {
-        throw new Error('Invalid tweet data received');
-      }
+    // Check if we have valid tweet data
+    if (!tweets.data?.data || !Array.isArray(tweets.data.data)) {
+      throw new Error('Invalid tweet data received');
+    }
 
-      // Get the user data from includes
-      const users = tweets.includes?.users || [];
-      const userMap = new Map(users.map(user => [user.id, user]));
+    // Get user data from the includes
+    const users = tweets.includes?.users || [];
+    const userMap = new Map(users.map(user => [user.id, user]));
 
-      // Format the response
-      const formattedTweets = tweets.data.data.map(tweet => {
-        const author = userMap.get(tweet.author_id) || {
-          name: 'Unknown',
-          username: 'unknown',
-          profile_image_url: 'https://abs.twimg.com/sticky/default_profile_images/default_profile.png'
-        };
-
-        return {
-          id: tweet.id,
-          text: tweet.text,
-          created_at: tweet.created_at,
-          metrics: tweet.public_metrics || {
-            retweet_count: 0,
-            reply_count: 0,
-            like_count: 0,
-            quote_count: 0
-          },
-          author: {
-            id: tweet.author_id,
-            name: author.name,
-            username: author.username,
-            profile_image_url: author.profile_image_url
-          }
-        };
-      });
-
-      // Update cache with rate limit info
-      tweetsCache = {
-        data: formattedTweets,
-        lastFetched: now,
-        rateLimit: timelineRateLimit
+    // Process tweets with user data
+    const processedTweets = tweets.data.data.map(tweet => {
+      const user = userMap.get(tweet.author_id) || {
+        name: req.user.displayName,
+        username: req.user.username,
+        profile_image_url: req.user.photos?.[0]?.value
       };
 
-      return res.json({
-        success: true,
-        tweets: formattedTweets,
-        cached: false
-      });
-
-    } catch (apiError) {
-      console.error('Twitter API error:', apiError);
-
-      // Handle rate limit error with backoff
-      if (apiError.code === 429) {
-        const resetTime = (apiError.rateLimit?.reset || Math.floor((now + 15 * 60 * 1000) / 1000)) * 1000;
-        const waitTime = Math.max(resetTime - now, 0);
-        console.log(`Rate limited, waiting ${waitTime / 1000} seconds`);
-        
-        // If we have cached data, return it immediately
-        if (hasCachedData) {
-          setRateLimitHeaders(res, tweetsCache.rateLimit, now);
-          return res.json({
-            success: true,
-            tweets: tweetsCache.data,
-            cached: true,
-            notice: 'Rate limit reached - showing cached tweets'
-          });
+      return {
+        ...tweet,
+        user: {
+          name: user.name,
+          username: user.username,
+          profile_image_url: user.profile_image_url
         }
-        
-        // Otherwise, wait and retry once
-        await delay(waitTime);
-        return res.status(429).json({
-          success: false,
-          error: 'Rate limit exceeded. Please try again later.'
-        });
-      }
+      };
+    });
 
-      // For other errors, return cached data if available
+    // Update cache
+    tweetsCache.data = processedTweets;
+    tweetsCache.lastFetched = now;
+
+    return res.json({
+      success: true,
+      tweets: processedTweets,
+      cached: false
+    });
+  } catch (error) {
+    console.error('Error in /api/tweets:', error);
+    
+    // Handle rate limit error
+    if (error.code === 429) {
+      const resetTime = error._headers?.get('x-rate-limit-reset');
+      const defaultResetTime = Math.floor((now + 15 * 60 * 1000) / 1000);
+      
+      // If we have cached data, return it
       if (hasCachedData) {
-        setRateLimitHeaders(res, tweetsCache.rateLimit, now);
         return res.json({
           success: true,
           tweets: tweetsCache.data,
           cached: true,
-          notice: 'Error fetching new tweets - showing cached tweets'
+          notice: 'Rate limit reached - showing cached tweets'
         });
       }
-
-      throw apiError;
+      
+      return res.status(429).json({
+        success: false,
+        error: 'Rate limit exceeded',
+        resetTime: resetTime ? parseInt(resetTime) * 1000 : defaultResetTime * 1000
+      });
     }
-  } catch (error) {
-    console.error('Error in /api/tweets:', error);
-    
-    // Set rate limit headers even in error cases
-    setRateLimitHeaders(res, tweetsCache.rateLimit, now);
-    
-    return res.status(error.code === 429 ? 429 : 500).json({
+
+    // For other errors, return cached data if available
+    if (hasCachedData) {
+      return res.json({
+        success: true,
+        tweets: tweetsCache.data,
+        cached: true,
+        notice: 'Error fetching new tweets - showing cached tweets'
+      });
+    }
+
+    return res.status(500).json({
       success: false,
-      error: error.code === 429 
-        ? 'Rate limit exceeded. Please try again later.' 
-        : `Error: ${error.message || 'Unknown error'}`
+      error: `Error: ${error.message || 'Unknown error'}`
     });
   }
 });
@@ -636,12 +624,11 @@ app.get('/auth/twitter', passport.authenticate('twitter'));
 
 app.get('/api/twitter/callback', 
   passport.authenticate('twitter', { 
-    failureRedirect: 'http://localhost:3000/login',
+    failureRedirect: `${FRONTEND_URL}/login`,
     session: true 
   }),
   (req, res) => {
-    // Redirect back to frontend
-    res.redirect('http://localhost:3000');
+    res.redirect(FRONTEND_URL);
   }
 );
 
@@ -679,8 +666,49 @@ app.get('/api/analytics', async (req, res) => {
       });
     }
 
+    const now = Date.now();
+    const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache duration
+    const hasCachedData = analyticsCache.data && Array.isArray(analyticsCache.data);
+    const cacheAge = now - (analyticsCache.lastFetched || 0);
+
+    // Set default rate limit headers
+    const defaultRateLimit = {
+      limit: 900,
+      remaining: 850,
+      reset: Math.floor((now + 15 * 60 * 1000) / 1000)
+    };
+    setRateLimitHeaders(res, defaultRateLimit, now);
+
+    // Return cached data if it's fresh enough
+    if (hasCachedData && cacheAge < CACHE_DURATION) {
+      if (analyticsCache.rateLimit) {
+        setRateLimitHeaders(res, analyticsCache.rateLimit, now);
+      }
+      return res.json({
+        success: true,
+        analytics: analyticsCache.data,
+        cached: true
+      });
+    }
+
     // Initialize Twitter client with user tokens
-    initializeTwitterClient(req.user);
+    try {
+      initializeTwitterClient(req.user);
+    } catch (error) {
+      console.error('Failed to initialize Twitter client:', error);
+      if (hasCachedData) {
+        return res.json({
+          success: true,
+          analytics: analyticsCache.data,
+          cached: true,
+          notice: 'Authentication error - showing cached analytics'
+        });
+      }
+      return res.status(401).json({
+        success: false,
+        error: 'Twitter authentication failed'
+      });
+    }
 
     // Get user's tweets with engagement metrics
     const tweets = await twitterClient.v2.userTimeline(req.user.id, {
@@ -688,6 +716,17 @@ app.get('/api/analytics', async (req, res) => {
       exclude: ['replies', 'retweets'],
       'tweet.fields': ['public_metrics', 'created_at', 'text'],
     });
+
+    // Update rate limit info from response
+    if (tweets._headers) {
+      const rateLimit = {
+        limit: parseInt(tweets._headers['x-rate-limit-limit']) || 900,
+        remaining: parseInt(tweets._headers['x-rate-limit-remaining']) || 850,
+        reset: parseInt(tweets._headers['x-rate-limit-reset']) || Math.floor((now + 15 * 60 * 1000) / 1000)
+      };
+      setRateLimitHeaders(res, rateLimit, now);
+      analyticsCache.rateLimit = rateLimit;
+    }
 
     const analytics = tweets.data.data.map(tweet => ({
       id: tweet.id,
@@ -701,21 +740,49 @@ app.get('/api/analytics', async (req, res) => {
       }
     }));
 
+    // Update analytics cache
+    analyticsCache.data = analytics;
+    analyticsCache.lastFetched = now;
+
     return res.json({
       success: true,
-      analytics
+      analytics,
+      cached: false
     });
-
   } catch (error) {
     console.error('Analytics error:', error);
     
-    // Handle rate limiting
+    const hasCache = analyticsCache.data && Array.isArray(analyticsCache.data);
+    
     if (error.code === 429) {
       const resetTime = error._headers?.get('x-rate-limit-reset');
+      const now = Date.now();
+      const defaultResetTime = now + (15 * 60 * 1000);
+      
+      // Return cached data if available during rate limit
+      if (hasCache) {
+        return res.json({
+          success: true,
+          analytics: analyticsCache.data,
+          cached: true,
+          notice: 'Rate limit reached - showing cached analytics'
+        });
+      }
+      
       return res.status(429).json({
         success: false,
         error: 'Rate limit exceeded',
-        resetTime: resetTime ? parseInt(resetTime) * 1000 : null
+        resetTime: resetTime ? parseInt(resetTime) * 1000 : defaultResetTime
+      });
+    }
+
+    // For other errors, return cached data if available
+    if (hasCache) {
+      return res.json({
+        success: true,
+        analytics: analyticsCache.data,
+        cached: true,
+        notice: 'Error fetching analytics - showing cached data'
       });
     }
 

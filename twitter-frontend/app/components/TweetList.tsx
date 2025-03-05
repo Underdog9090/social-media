@@ -116,27 +116,42 @@ export default function TweetList() {
         return;
       }
 
-      // For manual refreshes, check the cooldown
-      if (isManualRefresh && !canRefresh()) {
+      // Don't fetch if we're rate limited
+      if (rateLimitReset && rateLimitReset > Date.now()) {
         const timeRemaining = getTimeUntilNextRefresh();
-        if (dailyLimitReset) {
-          setNotice(`Daily limit reached. Please wait ${timeRemaining} for reset.`);
-        } else {
-          setNotice(`Please wait ${timeRemaining} before refreshing again`);
-        }
+        setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
         return;
       }
 
       try {
         setLoading(true);
         setError(null);
-        setNotice(null);
         
         const response = await fetch('http://localhost:3001/api/tweets', {
           credentials: 'include',
         });
         
-        // Update rate limit headers
+        const data = await response.json();
+
+        // Handle rate limit response
+        if (response.status === 429) {
+          const resetTime = data.resetTime;
+          if (resetTime) {
+            setRateLimitReset(resetTime);
+            const timeRemaining = formatTimeRemaining(resetTime - Date.now());
+            setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
+          }
+          return;
+        }
+
+        // Handle authentication error
+        if (response.status === 401) {
+          setIsAuthenticated(false);
+          setError('Please log in to view tweets');
+          return;
+        }
+
+        // Update rate limit headers if they exist
         const rateLimitReset = response.headers.get('x-rate-limit-reset');
         const rateLimitRemaining = response.headers.get('x-rate-limit-remaining');
         const rateLimitLimit = response.headers.get('x-rate-limit-limit');
@@ -151,33 +166,21 @@ export default function TweetList() {
         if (dailyLimitRemaining) setDailyRequestsUsed(parseInt(dailyLimitRemaining));
         if (dailyLimitLimit) setDailyRequestsLimit(parseInt(dailyLimitLimit));
 
-        const data = await response.json();
-
-        if (response.status === 401) {
-          setIsAuthenticated(false);
-          setError('Please log in to view tweets');
-          return;
-        }
-
+        // Handle successful response
         if (data.success) {
-          setTweets(data.tweets);
-          if (data.notice) {
-            setNotice(data.notice);
-          }
-          setLastRefreshTime(Date.now());
-        } else {
-          if (response.status === 429) {
-            const timeRemaining = getTimeUntilNextRefresh();
-            if (dailyLimitReset && typeof dailyLimitReset === 'number' && dailyLimitReset > Date.now()) {
-              setNotice(`Daily API limit reached. Please wait ${timeRemaining} for reset.`);
+          if (Array.isArray(data.tweets)) {
+            setTweets(data.tweets);
+            setLastRefreshTime(Date.now());
+            if (data.notice) {
+              setNotice(data.notice);
             } else {
-              setNotice(`Rate limit exceeded. Please wait ${timeRemaining} before trying again.`);
+              setNotice(null);
             }
-          } else if (tweets.length > 0) {
-            setNotice('Error refreshing tweets - showing existing tweets');
           } else {
-            setError(data.error || 'Failed to fetch tweets');
+            setError('Invalid tweet data received');
           }
+        } else {
+          setError(data.error || 'Failed to fetch tweets');
         }
       } catch (err: any) {
         console.error('Fetch error:', err);
@@ -185,83 +188,34 @@ export default function TweetList() {
           setIsAuthenticated(false);
           setError('Please log in to view tweets');
         } else {
-          setError('Failed to connect to the server. Please check if the backend is running.');
-        }
-        if (tweets.length > 0) {
-          setNotice('Error refreshing tweets - showing existing tweets');
+          setError('Failed to connect to the server');
         }
       } finally {
         setLoading(false);
       }
     }, 5000),
-    [tweets.length, dailyLimitReset, canRefresh, lastRefreshTime, rateLimitReset, isAuthenticated]
+    [isAuthenticated, getTimeUntilNextRefresh]
   );
 
-  // Initial fetch and auto-refresh setup
+  // Initial fetch only - no auto refresh
   useEffect(() => {
-    let mounted = true;
-    let retryCount = 0;
-    const MAX_RETRIES = 3; // Increased from 2 to 3
-    const INITIAL_FETCH_TIMEOUT = 90000; // Increased from 60s to 90s
-
-    const initialFetch = async () => {
-      if (!isAuthenticated || retryCount >= MAX_RETRIES) {
-        if (mounted) {
-          setError('Failed to load tweets. Please try refreshing the page.');
-        }
-        return;
-      }
-
-      try {
-        // Set a timeout for the initial fetch
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Initial fetch timeout')), INITIAL_FETCH_TIMEOUT);
-        });
-
-        await Promise.race([fetchTweets(), timeoutPromise]);
-      } catch (err: any) {
-        console.error('Initial fetch error:', err);
-        if (mounted) {
-          retryCount++;
-          if (retryCount < MAX_RETRIES) {
-            setError(`Loading tweets... (Attempt ${retryCount + 1}/${MAX_RETRIES})`);
-            setTimeout(initialFetch, 5000);
-          } else {
-            setError('Failed to load tweets. Please try refreshing the page.');
-          }
-        }
-      }
-    };
-
-    if (isAuthenticated) {
-      initialFetch();
-    }
+    if (!isAuthenticated) return;
     
-    // Auto-refresh every 5 minutes, but only if authenticated and not rate limited
-    const intervalId = setInterval(() => {
-      if (isAuthenticated && canRefresh() && !loading) {
-        fetchTweets();
-      }
-    }, 5 * 60 * 1000);
+    // Initial fetch
+    fetchTweets();
 
-    // Update notice with countdown every second when rate limited
+    // Update notice with countdown when rate limited
     const countdownId = setInterval(() => {
-      if (dailyLimitReset || rateLimitReset || !canRefresh()) {
+      if (rateLimitReset && rateLimitReset > Date.now()) {
         const timeRemaining = getTimeUntilNextRefresh();
-        if (dailyLimitReset) {
-          setNotice(`Daily API limit reached. Please wait ${timeRemaining} for reset.`);
-        } else if (timeRemaining !== '0 seconds') {
-          setNotice(`Please wait ${timeRemaining} before refreshing again`);
-        }
+        setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
       }
     }, 1000);
 
     return () => {
-      mounted = false;
-      clearInterval(intervalId);
       clearInterval(countdownId);
     };
-  }, [rateLimitReset, dailyLimitReset, fetchTweets, isAuthenticated, loading]);
+  }, [isAuthenticated, fetchTweets, rateLimitReset, getTimeUntilNextRefresh]);
 
   const handleManualRefresh = () => {
     fetchTweets(true);
