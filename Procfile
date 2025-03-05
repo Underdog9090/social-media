@@ -1,1 +1,0 @@
-web: cd twitter-backend && npm start 

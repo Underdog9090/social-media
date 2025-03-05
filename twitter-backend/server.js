@@ -9,7 +9,6 @@ import connectDB from './models/db.js';
 import ScheduledTweet from './models/ScheduledTweet.js';
 import UserSettings from './models/UserSettings.js';
 import User from './models/User.js';
-import { setupSecurityMiddleware } from './middleware/security.js';
 
 // Load environment variables
 dotenv.config();
@@ -36,9 +35,6 @@ const initializeTwitterClient = (user) => {
 
 const app = express();
 const port = process.env.PORT || 3001;
-
-// Setup security middleware
-setupSecurityMiddleware(app);
 
 // Session configuration
 app.use(session({
