@@ -544,8 +544,11 @@ app.get('/api/tweets', async (req, res) => {
       };
 
       return {
-        ...tweet,
-        user: {
+        id: tweet.id,
+        text: tweet.text,
+        created_at: tweet.created_at,
+        metrics: tweet.public_metrics,
+        author: {
           name: user.name,
           username: user.username,
           profile_image_url: user.profile_image_url
