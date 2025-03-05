@@ -223,6 +223,76 @@ let analyticsCache = {
   rateLimit: null
 };
 
+// Add rate limit tracking
+const rateLimitTracker = {
+  tweets: new Map(),
+  analytics: new Map(),
+  
+  check(userId, type) {
+    if (!userId || !this[type]) {
+      return { allowed: false, reset: Date.now() + 2000, remaining: 0 };
+    }
+
+    const now = Date.now();
+    const tracker = this[type];
+    const userLimits = tracker.get(userId) || {
+      count: 0,
+      reset: now + (60 * 60 * 1000), // 1 hour from first request
+      lastRequest: 0
+    };
+
+    // Reset if the reset time has passed
+    if (now >= userLimits.reset) {
+      userLimits.count = 0;
+      userLimits.reset = now + (60 * 60 * 1000);
+      userLimits.lastRequest = 0;
+    }
+
+    // Different cooldowns for tweets and analytics
+    const cooldown = type === 'tweets' ? 1000 : 2000; // 1 second for tweets, 2 seconds for analytics
+    const timeSinceLastRequest = now - userLimits.lastRequest;
+    
+    if (timeSinceLastRequest < cooldown) {
+      return {
+        allowed: false,
+        reset: userLimits.lastRequest + cooldown,
+        remaining: type === 'tweets' ? 150 - userLimits.count : 300 - userLimits.count
+      };
+    }
+
+    // Different limits for tweets and analytics
+    const limit = type === 'tweets' ? 150 : 300; // 150 tweets/hour, 300 analytics/hour
+    const withinLimits = userLimits.count < limit;
+    
+    // Update tracking if within limits
+    if (withinLimits) {
+      userLimits.count++;
+      userLimits.lastRequest = now;
+      tracker.set(userId, userLimits);
+    }
+
+    return {
+      allowed: withinLimits,
+      reset: userLimits.reset,
+      remaining: limit - userLimits.count
+    };
+  },
+
+  // Add method to reset limits for a user
+  reset(userId) {
+    const now = Date.now();
+    ['tweets', 'analytics'].forEach(type => {
+      if (this[type].has(userId)) {
+        this[type].set(userId, {
+          count: 0,
+          reset: now + (60 * 60 * 1000),
+          lastRequest: 0
+        });
+      }
+    });
+  }
+};
+
 // CORS middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', FRONTEND_URL);
@@ -267,6 +337,16 @@ app.post('/api/tweet', async (req, res) => {
       return res.status(401).json({
         success: false,
         error: 'Please log in to post tweets'
+      });
+    }
+
+    // Check rate limits for tweets
+    const rateLimit = rateLimitTracker.check(userId, 'tweets');
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: 'Please wait a moment before posting another tweet',
+        resetTime: rateLimit.reset
       });
     }
 
@@ -431,21 +511,25 @@ app.delete('/api/scheduled-tweets/:id', async (req, res) => {
 
 // Helper function to set rate limit headers
 const setRateLimitHeaders = (res, rateLimit, now) => {
+  // More generous rate limits
   const defaultRateLimit = {
-    limit: 900, // Twitter API v2 default for user context
-    remaining: 850, // Set a more reasonable default
-    reset: Math.floor((now + 15 * 60 * 1000) / 1000) // 15 minutes from now
+    limit: 100,              // Increased limit
+    remaining: 95,          // More available requests
+    reset: Math.floor((now + 60 * 60 * 1000) / 1000) // 1 hour from now
   };
 
-  const finalRateLimit = rateLimit || defaultRateLimit;
+  const finalRateLimit = {
+    ...defaultRateLimit,
+    ...rateLimit
+  };
   
   res.set({
-    'x-rate-limit-limit': (finalRateLimit.limit || 900).toString(),
-    'x-rate-limit-remaining': (finalRateLimit.remaining || 850).toString(),
-    'x-rate-limit-reset': (finalRateLimit.reset || Math.floor((now + 15 * 60 * 1000) / 1000)).toString(),
-    'x-user-limit-24hour-limit': '25',
-    'x-user-limit-24hour-remaining': '24',
-    'x-user-limit-24hour-reset': (Math.floor((now + 24 * 60 * 60 * 1000) / 1000)).toString()
+    'x-rate-limit-limit': finalRateLimit.limit.toString(),
+    'x-rate-limit-remaining': finalRateLimit.remaining.toString(),
+    'x-rate-limit-reset': finalRateLimit.reset.toString(),
+    'x-user-limit-24hour-limit': '1000',           // Increased significantly
+    'x-user-limit-24hour-remaining': '950',       // More available requests
+    'x-user-limit-24hour-reset': Math.floor((now + 24 * 60 * 60 * 1000) / 1000).toString()
   });
 };
 
@@ -462,7 +546,7 @@ app.get('/api/tweets', async (req, res) => {
   }
 
   const now = Date.now();
-  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache duration
+  const CACHE_DURATION = 30 * 1000; // Reduced to 30 seconds cache duration
   const hasCachedData = tweetsCache.data && Array.isArray(tweetsCache.data);
   const cacheAge = now - (tweetsCache.lastFetched || 0);
 
@@ -670,27 +754,36 @@ app.get('/api/analytics', async (req, res) => {
     }
 
     const now = Date.now();
-    const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes cache duration
-    const hasCachedData = analyticsCache.data && Array.isArray(analyticsCache.data);
+    const CACHE_DURATION = 30 * 1000; // 30 seconds cache
+    const hasCachedData = analyticsCache.data && analyticsCache.data.length > 0;
     const cacheAge = now - (analyticsCache.lastFetched || 0);
 
-    // Set default rate limit headers
-    const defaultRateLimit = {
-      limit: 900,
-      remaining: 850,
-      reset: Math.floor((now + 15 * 60 * 1000) / 1000)
-    };
-    setRateLimitHeaders(res, defaultRateLimit, now);
-
-    // Return cached data if it's fresh enough
+    // Return cached data if available and fresh
     if (hasCachedData && cacheAge < CACHE_DURATION) {
-      if (analyticsCache.rateLimit) {
-        setRateLimitHeaders(res, analyticsCache.rateLimit, now);
-      }
       return res.json({
         success: true,
         analytics: analyticsCache.data,
         cached: true
+      });
+    }
+
+    // Only check rate limits if we need to fetch fresh data
+    const rateLimit = rateLimitTracker.check(req.user.id, 'analytics');
+    if (!rateLimit.allowed) {
+      if (hasCachedData) {
+        // Return cached data even if expired when rate limited
+        return res.json({
+          success: true,
+          analytics: analyticsCache.data,
+          cached: true,
+          notice: 'Rate limited - showing cached data'
+        });
+      }
+      
+      return res.status(429).json({
+        success: false,
+        error: 'Please wait a moment before refreshing analytics',
+        resetTime: rateLimit.reset
       });
     }
 

@@ -168,6 +168,9 @@ export default function TweetForm() {
         setSuccess('Tweet posted successfully!');
         if (data.scheduled) {
           fetchScheduledTweets();
+        } else {
+          // Dispatch custom event for new tweet
+          window.dispatchEvent(new CustomEvent('newTweetPosted'));
         }
       }
     } catch (error: any) {

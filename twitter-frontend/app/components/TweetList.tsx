@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import throttle from 'lodash/throttle';
 
 interface Tweet {
@@ -87,7 +87,7 @@ export default function TweetList() {
     return parts.join(' ');
   };
 
-  const getTimeUntilNextRefresh = () => {
+  const getTimeUntilNextRefresh = useCallback(() => {
     const now = Date.now();
     
     // If we have a daily limit reset time and it's in the future
@@ -107,7 +107,7 @@ export default function TweetList() {
     }
     
     return "0 seconds";
-  };
+  }, [dailyLimitReset, rateLimitReset, lastRefreshTime, REFRESH_COOLDOWN]);
 
   const fetchTweets = useCallback(
     throttle(async (isManualRefresh = false) => {
@@ -118,9 +118,7 @@ export default function TweetList() {
 
       // Don't fetch if we're rate limited
       if (rateLimitReset && rateLimitReset > Date.now()) {
-        const timeRemaining = getTimeUntilNextRefresh();
-        setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
-        return;
+        return; // Don't update notice here, let the separate effect handle it
       }
 
       try {
@@ -138,8 +136,6 @@ export default function TweetList() {
           const resetTime = data.resetTime;
           if (resetTime) {
             setRateLimitReset(resetTime);
-            const timeRemaining = formatTimeRemaining(resetTime - Date.now());
-            setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
           }
           return;
         }
@@ -173,8 +169,6 @@ export default function TweetList() {
             setLastRefreshTime(Date.now());
             if (data.notice) {
               setNotice(data.notice);
-            } else {
-              setNotice(null);
             }
           } else {
             setError('Invalid tweet data received');
@@ -193,33 +187,53 @@ export default function TweetList() {
       } finally {
         setLoading(false);
       }
-    }, 5000),
-    [isAuthenticated, getTimeUntilNextRefresh]
+    }, 1000), // Reduced throttle time to 1 second for better responsiveness
+    [isAuthenticated]
   );
 
-  // Initial fetch only - no auto refresh
+  // Initial fetch and new tweet listener
   useEffect(() => {
     if (!isAuthenticated) return;
     
+    const handleNewTweet = () => {
+      // Small delay to ensure the tweet is available on the server
+      setTimeout(() => fetchTweets(true), 500);
+    };
+
     // Initial fetch
     fetchTweets();
+    
+    window.addEventListener('newTweetPosted', handleNewTweet);
+    return () => window.removeEventListener('newTweetPosted', handleNewTweet);
+  }, [isAuthenticated, fetchTweets]);
 
-    // Update notice with countdown when rate limited
-    const countdownId = setInterval(() => {
-      if (rateLimitReset && rateLimitReset > Date.now()) {
-        const timeRemaining = getTimeUntilNextRefresh();
-        setNotice(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
-      }
-    }, 1000);
+  // Rate limit notice effect - with stable reference
+  const stableNotice = useMemo(() => {
+    if (!rateLimitReset || rateLimitReset <= Date.now()) {
+      return null;
+    }
+    const timeRemaining = getTimeUntilNextRefresh();
+    return `Rate limit reached. Please wait ${timeRemaining} before refreshing.`;
+  }, [rateLimitReset, getTimeUntilNextRefresh]);
 
-    return () => {
-      clearInterval(countdownId);
-    };
-  }, [isAuthenticated, fetchTweets, rateLimitReset, getTimeUntilNextRefresh]);
+  // Update notice with stable value
+  useEffect(() => {
+    setNotice(stableNotice);
+  }, [stableNotice]);
 
-  const handleManualRefresh = () => {
-    fetchTweets(true);
-  };
+  const handleManualRefresh = useCallback(() => {
+    if (canRefresh()) {
+      fetchTweets(true);
+    }
+  }, [canRefresh, fetchTweets]);
+
+  // Memoize sorted tweets to prevent unnecessary re-renders
+  const sortedTweets = useMemo(() => 
+    [...tweets].sort((a, b) => 
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    ),
+    [tweets]
+  );
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleDateString('en-US', {
@@ -339,7 +353,7 @@ export default function TweetList() {
         </div>
       ) : (
         <div className="space-y-4">
-          {tweets.map((tweet) => (
+          {sortedTweets.map((tweet) => (
             <div
               key={tweet.id}
               className="bg-white rounded-lg shadow p-6 hover:shadow-md transition-shadow"
