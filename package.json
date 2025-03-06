@@ -1,0 +1,13 @@
+{
+  "name": "social-media-app",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "twitter-frontend",
+    "twitter-backend"
+  ],
+  "scripts": {
+    "build": "cd twitter-frontend && npm install && npm run build",
+    "start": "cd twitter-backend && npm start"
+  }
+} 

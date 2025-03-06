@@ -53,6 +53,11 @@ export default function TweetForm() {
 
   // Add function to fetch recent tweets
   const fetchRecentTweets = async () => {
+    // Don't fetch if already loading or if there's a rate limit error
+    if (tweetsLoading || tweetsError?.includes('Rate limit')) {
+      return;
+    }
+    
     try {
       setTweetsLoading(true);
       setTweetsError(null);
@@ -65,7 +70,8 @@ export default function TweetForm() {
         const data = await response.json();
         const resetTime = data.resetTime;
         const waitTime = resetTime ? resetTime - Date.now() : 60000; // Default to 1 minute
-        setTweetsError(`Rate limit reached. Please wait ${formatTimeRemaining(waitTime)} before refreshing.`);
+        setRateLimitCountdown(waitTime);
+        setTweetsError(`Rate limit reached - Please wait ${formatTimeRemaining(waitTime)} before refreshing.`);
         setTweetsLoading(false);
         return;
       }
@@ -89,6 +95,10 @@ export default function TweetForm() {
         // Handle notices
         if (data.notice) {
           setTweetsError(data.notice);
+          if (data.notice.includes('Rate limit')) {
+            const waitTime = data.remainingTime || 30000;
+            setRateLimitCountdown(waitTime);
+          }
         } else {
           setTweetsError(null);
         }
@@ -114,7 +124,10 @@ export default function TweetForm() {
         setIsAuthenticated(data.success);
         if (data.success) {
           fetchScheduledTweets();
-          fetchRecentTweets();
+          // Don't fetch tweets immediately, wait a moment to avoid rate limits
+          setTimeout(() => {
+            fetchRecentTweets();
+          }, 1000);
         }
       } catch (err) {
         console.error('Auth check failed:', err);
@@ -129,29 +142,41 @@ export default function TweetForm() {
   useEffect(() => {
     let refreshTimer: NodeJS.Timeout;
     if (isAuthenticated) {
-      // Initial fetch
-      fetchRecentTweets();
       // Set up periodic refresh with a longer interval to avoid rate limits
       refreshTimer = setInterval(() => {
         // Only refresh if not currently loading and no rate limit error
-        if (!tweetsLoading && !tweetsError?.includes('Rate limit')) {
+        if (!tweetsLoading && !tweetsError?.includes('Rate limit') && !rateLimitCountdown) {
           fetchRecentTweets();
         }
-      }, 30000); // Increase to 30 seconds to avoid hitting rate limits
+      }, 60000); // Increase to 60 seconds to avoid hitting rate limits
     }
     return () => {
       if (refreshTimer) clearInterval(refreshTimer);
     };
-  }, [isAuthenticated, tweetsLoading, tweetsError]);
+  }, [isAuthenticated, tweetsLoading, tweetsError, rateLimitCountdown]);
 
   // Add countdown timer effect
   useEffect(() => {
     let timer: NodeJS.Timeout;
     if (rateLimitCountdown && rateLimitCountdown > 0) {
+      // Update the error message immediately with the current countdown
+      if (error && error.includes('Rate limit reached')) {
+        setError(`Rate limit reached - Please wait ${formatTimeRemaining(rateLimitCountdown)} before refreshing`);
+      }
+      
       timer = setInterval(() => {
         setRateLimitCountdown(prev => {
-          if (prev && prev > 0) {
-            return prev - 1000; // Decrease by 1 second (1000ms)
+          if (prev && prev > 1000) {
+            const newValue = prev - 1000; // Decrease by 1 second (1000ms)
+            // Update the error message with the new countdown
+            if (error && error.includes('Rate limit reached')) {
+              setError(`Rate limit reached - Please wait ${formatTimeRemaining(newValue)} before refreshing`);
+            }
+            return newValue;
+          }
+          // When countdown reaches zero
+          if (error && error.includes('Rate limit reached')) {
+            setError('You can now refresh or post a new tweet');
           }
           setRateLimitInfo(null); // Clear rate limit info when countdown ends
           return null;
@@ -161,7 +186,7 @@ export default function TweetForm() {
     return () => {
       if (timer) clearInterval(timer);
     };
-  }, [rateLimitCountdown]);
+  }, [rateLimitCountdown, error]);
 
   const fetchScheduledTweets = async () => {
     try {
@@ -273,7 +298,7 @@ export default function TweetForm() {
           remainingCount: data.remainingCount,
           totalLimit: data.totalLimit
         });
-        setError(`Rate limit reached. Please wait ${formatTimeRemaining(remainingTime)} before trying again.`);
+        setError(`Rate limit reached - Please wait ${formatTimeRemaining(remainingTime)} before refreshing`);
         fetchRecentTweets(); // Add this line to refresh tweets even during rate limit
         setIsSubmitting(false);
         return;
@@ -292,7 +317,12 @@ export default function TweetForm() {
         if (data.scheduled) {
           fetchScheduledTweets();
         } else {
-          fetchRecentTweets(); // Replace window.dispatchEvent with direct fetch
+          // Immediately fetch recent tweets after posting
+          setTimeout(() => {
+            fetchRecentTweets();
+            // Also dispatch event for TweetList component to refresh
+            window.dispatchEvent(new CustomEvent('newTweetPosted'));
+          }, 500); // Small delay to ensure the tweet is available on the server
         }
       }
     } catch (error: any) {
@@ -407,7 +437,7 @@ export default function TweetForm() {
                 <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
                   <p className="text-yellow-800">
                     {error}
-                    {rateLimitCountdown && rateLimitCountdown > 0 && (
+                    {rateLimitCountdown && rateLimitCountdown > 0 && !error?.includes('Rate limit reached') && (
                       <span className="block mt-2 font-medium">
                         Time remaining: {formatTimeRemaining(rateLimitCountdown)}
                       </span>

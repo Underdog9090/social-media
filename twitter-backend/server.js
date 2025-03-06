@@ -250,21 +250,21 @@ const rateLimitTracker = {
     }
 
     // Different cooldowns for tweets and analytics
-    const cooldown = type === 'tweets' ? 30000 : 60000; // 30 seconds for tweets, 1 minute for analytics
+    const cooldown = type === 'tweets' ? 60000 : 120000; // 60 seconds for tweets, 2 minutes for analytics
     const timeSinceLastRequest = now - userLimits.lastRequest;
     
     if (timeSinceLastRequest < cooldown) {
       return {
         allowed: false,
         reset: userLimits.lastRequest + cooldown,
-        remaining: type === 'tweets' ? 25 - userLimits.count : 15 - userLimits.count,
+        remaining: type === 'tweets' ? 15 - userLimits.count : 10 - userLimits.count,
         nextAllowedTime: userLimits.lastRequest + cooldown,
         remainingTime: cooldown - timeSinceLastRequest
       };
     }
 
     // Different limits for tweets and analytics
-    const limit = type === 'tweets' ? 25 : 15; // 25 tweets/15min, 15 analytics/15min
+    const limit = type === 'tweets' ? 15 : 10; // 15 tweets/15min, 10 analytics/15min
     const withinLimits = userLimits.count < limit;
     
     // Update tracking if within limits
@@ -292,7 +292,7 @@ const rateLimitTracker = {
     const now = Date.now();
     if (now >= userLimits.reset) return now;
 
-    const cooldown = type === 'tweets' ? 30000 : 60000;
+    const cooldown = type === 'tweets' ? 60000 : 120000;
     return Math.max(userLimits.lastRequest + cooldown, now);
   },
   
@@ -300,9 +300,9 @@ const rateLimitTracker = {
   getRemainingCount(userId, type) {
     const tracker = this[type];
     const userLimits = tracker.get(userId);
-    if (!userLimits) return type === 'tweets' ? 25 : 15;
+    if (!userLimits) return type === 'tweets' ? 15 : 10;
     
-    const limit = type === 'tweets' ? 25 : 15;
+    const limit = type === 'tweets' ? 15 : 10;
     return Math.max(0, limit - userLimits.count);
   }
 };
@@ -345,8 +345,8 @@ app.get('/', (req, res) => {
 });
 
 // Constants
-const TWEET_CACHE_DURATION = 60 * 1000;  // Increase to 60 seconds for tweets
-const ANALYTICS_CACHE_DURATION = 60 * 1000;  // 60 seconds for analytics
+const TWEET_CACHE_DURATION = 30 * 1000;  // Increase to 30 seconds for tweets
+const ANALYTICS_CACHE_DURATION = 120 * 1000;  // 2 minutes for analytics
 const EXTENDED_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes for extended caching during rate limits
 
 // Tweet endpoint
@@ -384,7 +384,7 @@ app.post('/api/tweet', async (req, res) => {
         resetTime: rateLimit.nextAllowedTime,
         remainingTime: waitTime,
         remainingCount: remaining,
-        totalLimit: 25
+        totalLimit: 15
       });
     }
 
@@ -604,7 +604,7 @@ app.get('/api/tweets', async (req, res) => {
         resetTime: rateLimit.nextAllowedTime,
         remainingTime: waitTime,
         remainingRequests: remaining,
-        totalLimit: 25
+        totalLimit: 15
       });
     }
     
@@ -614,7 +614,7 @@ app.get('/api/tweets', async (req, res) => {
       resetTime: rateLimit.nextAllowedTime,
       remainingTime: waitTime,
       remainingRequests: remaining,
-      totalLimit: 25
+      totalLimit: 15
     });
   }
 
@@ -625,7 +625,7 @@ app.get('/api/tweets', async (req, res) => {
       tweets: tweetsCache.data,
       cached: true,
       remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-      totalLimit: 25
+      totalLimit: 15
     });
   }
 
@@ -650,7 +650,7 @@ app.get('/api/tweets', async (req, res) => {
           cached: true,
           notice: 'Authentication error - showing cached tweets',
           remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-          totalLimit: 25
+          totalLimit: 15
         });
       }
       return res.status(401).json({
@@ -689,7 +689,7 @@ app.get('/api/tweets', async (req, res) => {
           cached: true,
           notice: 'No recent tweets found - showing cached tweets',
           remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-          totalLimit: 25
+          totalLimit: 15
         });
       }
       
@@ -699,7 +699,7 @@ app.get('/api/tweets', async (req, res) => {
         cached: false,
         notice: 'No recent tweets found',
         remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-        totalLimit: 25
+        totalLimit: 15
       });
     }
 
@@ -737,7 +737,7 @@ app.get('/api/tweets', async (req, res) => {
       tweets: processedTweets,
       cached: false,
       remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-      totalLimit: 25
+      totalLimit: 15
     });
   } catch (error) {
     console.error('Error in /api/tweets:', error);
@@ -752,11 +752,11 @@ app.get('/api/tweets', async (req, res) => {
       if (userId) {
         const tracker = rateLimitTracker.tweets;
         const userLimits = tracker.get(userId) || {
-          count: 25, // Set to max to prevent further requests
+          count: 15, // Set to max to prevent further requests
           reset: actualResetTime,
           lastRequest: now
         };
-        userLimits.count = 25; // Max out the count
+        userLimits.count = 15; // Max out the count
         userLimits.reset = actualResetTime;
         tracker.set(userId, userLimits);
       }
@@ -771,7 +771,7 @@ app.get('/api/tweets', async (req, res) => {
           resetTime: actualResetTime,
           remainingTime: actualResetTime - now,
           remainingRequests: 0,
-          totalLimit: 25
+          totalLimit: 15
         });
       }
       
@@ -781,7 +781,7 @@ app.get('/api/tweets', async (req, res) => {
         resetTime: actualResetTime,
         remainingTime: actualResetTime - now,
         remainingRequests: 0,
-        totalLimit: 25
+        totalLimit: 15
       });
     }
 
@@ -793,7 +793,7 @@ app.get('/api/tweets', async (req, res) => {
         cached: true,
         notice: 'Error fetching new tweets - showing cached tweets',
         remainingRequests: rateLimitTracker.getRemainingCount(userId, 'tweets'),
-        totalLimit: 25
+        totalLimit: 15
       });
     }
 
@@ -886,7 +886,7 @@ app.get('/api/analytics', async (req, res) => {
           resetTime: rateLimit.nextAllowedTime,
           remainingTime: waitTime,
           remainingCount: remaining,
-          totalLimit: 15
+          totalLimit: 10
         });
       }
 
@@ -896,7 +896,7 @@ app.get('/api/analytics', async (req, res) => {
         resetTime: rateLimit.nextAllowedTime,
         remainingTime: waitTime,
         remainingCount: remaining,
-        totalLimit: 15
+        totalLimit: 10
       });
     }
 

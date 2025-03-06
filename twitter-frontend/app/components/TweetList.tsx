@@ -33,6 +33,7 @@ export default function TweetList() {
   const [rateRequestsRemaining, setRateRequestsRemaining] = useState<number | null>(null);
   const [rateRequestsLimit, setRateRequestsLimit] = useState<number | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [countdownTime, setCountdownTime] = useState<number | null>(null);
   const REFRESH_COOLDOWN = 180 * 1000; // 3 minutes cooldown
 
   // Check authentication status
@@ -118,7 +119,19 @@ export default function TweetList() {
 
       // Don't fetch if we're rate limited
       if (rateLimitReset && rateLimitReset > Date.now()) {
-        return; // Don't update notice here, let the separate effect handle it
+        const timeRemaining = rateLimitReset - Date.now();
+        setCountdownTime(timeRemaining);
+        setNotice(`Rate limit reached - Please wait ${formatTimeRemaining(timeRemaining)} before refreshing.`);
+        return;
+      }
+
+      // Don't fetch if we've fetched recently (unless it's a manual refresh)
+      if (!isManualRefresh) {
+        const now = Date.now();
+        const timeSinceLastRefresh = now - lastRefreshTime;
+        if (timeSinceLastRefresh < 30000) { // 30 seconds cooldown
+          return;
+        }
       }
 
       try {
@@ -134,9 +147,13 @@ export default function TweetList() {
         // Handle rate limit response
         if (response.status === 429) {
           const resetTime = data.resetTime;
+          const remainingTime = data.remainingTime || (resetTime ? resetTime - Date.now() : 60000);
           if (resetTime) {
             setRateLimitReset(resetTime);
+            setCountdownTime(remainingTime);
+            setNotice(`Rate limit reached - Please wait ${formatTimeRemaining(remainingTime)} before refreshing.`);
           }
+          setLoading(false);
           return;
         }
 
@@ -197,11 +214,13 @@ export default function TweetList() {
     
     const handleNewTweet = () => {
       // Small delay to ensure the tweet is available on the server
-      setTimeout(() => fetchTweets(true), 500);
+      setTimeout(() => fetchTweets(true), 1000);
     };
 
-    // Initial fetch
-    fetchTweets();
+    // Initial fetch with a delay to avoid rate limits
+    setTimeout(() => {
+      fetchTweets();
+    }, 2000);
     
     window.addEventListener('newTweetPosted', handleNewTweet);
     return () => window.removeEventListener('newTweetPosted', handleNewTweet);
@@ -213,13 +232,41 @@ export default function TweetList() {
       return null;
     }
     const timeRemaining = getTimeUntilNextRefresh();
-    return `Rate limit reached. Please wait ${timeRemaining} before refreshing.`;
+    return `Rate limit reached - Please wait ${timeRemaining} before refreshing.`;
   }, [rateLimitReset, getTimeUntilNextRefresh]);
 
   // Update notice with stable value
   useEffect(() => {
     setNotice(stableNotice);
-  }, [stableNotice]);
+    if (rateLimitReset && rateLimitReset > Date.now()) {
+      setCountdownTime(rateLimitReset - Date.now());
+    } else {
+      setCountdownTime(null);
+    }
+  }, [stableNotice, rateLimitReset]);
+
+  // Countdown timer effect
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (countdownTime && countdownTime > 0) {
+      timer = setInterval(() => {
+        setCountdownTime(prev => {
+          if (prev && prev > 1000) {
+            const newValue = prev - 1000;
+            // Update the notice with the new countdown
+            setNotice(`Rate limit reached - Please wait ${formatTimeRemaining(newValue)} before refreshing.`);
+            return newValue;
+          }
+          // When countdown reaches zero
+          setNotice('You can now refresh tweets');
+          return null;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [countdownTime]);
 
   const handleManualRefresh = useCallback(() => {
     if (canRefresh()) {
@@ -312,7 +359,14 @@ export default function TweetList() {
         <div>
           <h2 className="text-2xl font-semibold text-gray-800">Recent Tweets</h2>
           {notice && (
-            <p className="text-sm text-blue-600 mt-1">{notice}</p>
+            <p className="text-sm text-blue-600 mt-1">
+              {notice}
+              {countdownTime && countdownTime > 0 && !notice.includes(formatTimeRemaining(countdownTime)) && (
+                <span className="ml-1 font-medium">
+                  ({formatTimeRemaining(countdownTime)})
+                </span>
+              )}
+            </p>
           )}
         </div>
         {isAuthenticated && (
