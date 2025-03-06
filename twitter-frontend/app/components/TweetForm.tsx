@@ -19,7 +19,11 @@ export default function TweetForm() {
     scheduled?: boolean;
     scheduleId?: string;
     scheduledFor?: string;
-    error?: string 
+    error?: string;
+    resetTime?: number;
+    remainingTime?: number;
+    remainingCount?: number;
+    totalLimit?: number;
   } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isScheduling, setIsScheduling] = useState(false);
@@ -29,8 +33,77 @@ export default function TweetForm() {
   const [showCancelConfirm, setShowCancelConfirm] = useState<string | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [rateLimitCountdown, setRateLimitCountdown] = useState<number | null>(null);
+  const [rateLimitInfo, setRateLimitInfo] = useState<{
+    remainingTweets?: number;
+    totalLimit?: number;
+    usedCount?: number;
+    windowReset?: number;
+    cooldownTime?: number;
+  } | null>(null);
+  const [recentTweets, setRecentTweets] = useState<any[]>([]);
+  const [tweetsLoading, setTweetsLoading] = useState(false);
+  const [tweetsError, setTweetsError] = useState<string | null>(null);
+  const [tweetRateLimit, setTweetRateLimit] = useState<{
+    remainingRequests?: number;
+    totalLimit?: number;
+    usedCount?: number;
+    windowReset?: number;
+  } | null>(null);
 
-  // Check authentication status
+  // Add function to fetch recent tweets
+  const fetchRecentTweets = async () => {
+    try {
+      setTweetsLoading(true);
+      setTweetsError(null);
+      
+      const response = await fetch('http://localhost:3001/api/tweets', {
+        credentials: 'include',
+      });
+      
+      if (response.status === 429) {
+        const data = await response.json();
+        const resetTime = data.resetTime;
+        const waitTime = resetTime ? resetTime - Date.now() : 60000; // Default to 1 minute
+        setTweetsError(`Rate limit reached. Please wait ${formatTimeRemaining(waitTime)} before refreshing.`);
+        setTweetsLoading(false);
+        return;
+      }
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        setRecentTweets(data.tweets || []);
+        
+        // Handle rate limit info if available
+        if (data.remainingRequests !== undefined || data.rateLimit) {
+          const rateLimit = data.rateLimit || {};
+          setTweetRateLimit({
+            remainingRequests: data.remainingRequests || rateLimit.remaining,
+            totalLimit: data.totalLimit || rateLimit.limit,
+            usedCount: data.usedCount,
+            windowReset: data.windowReset || (rateLimit.reset ? rateLimit.reset * 1000 : null)
+          });
+        }
+        
+        // Handle notices
+        if (data.notice) {
+          setTweetsError(data.notice);
+        } else {
+          setTweetsError(null);
+        }
+      } else {
+        setTweetsError(data.error || 'Failed to fetch tweets');
+      }
+    } catch (err) {
+      console.error('Failed to fetch recent tweets:', err);
+      setTweetsError('Failed to fetch tweets');
+    } finally {
+      setTweetsLoading(false);
+    }
+  };
+
+  // Update useEffect to fetch recent tweets on mount and authentication
   useEffect(() => {
     const checkAuth = async () => {
       try {
@@ -41,6 +114,7 @@ export default function TweetForm() {
         setIsAuthenticated(data.success);
         if (data.success) {
           fetchScheduledTweets();
+          fetchRecentTweets();
         }
       } catch (err) {
         console.error('Auth check failed:', err);
@@ -50,6 +124,44 @@ export default function TweetForm() {
 
     checkAuth();
   }, []);
+
+  // Add auto-refresh for recent tweets
+  useEffect(() => {
+    let refreshTimer: NodeJS.Timeout;
+    if (isAuthenticated) {
+      // Initial fetch
+      fetchRecentTweets();
+      // Set up periodic refresh with a longer interval to avoid rate limits
+      refreshTimer = setInterval(() => {
+        // Only refresh if not currently loading and no rate limit error
+        if (!tweetsLoading && !tweetsError?.includes('Rate limit')) {
+          fetchRecentTweets();
+        }
+      }, 30000); // Increase to 30 seconds to avoid hitting rate limits
+    }
+    return () => {
+      if (refreshTimer) clearInterval(refreshTimer);
+    };
+  }, [isAuthenticated, tweetsLoading, tweetsError]);
+
+  // Add countdown timer effect
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (rateLimitCountdown && rateLimitCountdown > 0) {
+      timer = setInterval(() => {
+        setRateLimitCountdown(prev => {
+          if (prev && prev > 0) {
+            return prev - 1000; // Decrease by 1 second (1000ms)
+          }
+          setRateLimitInfo(null); // Clear rate limit info when countdown ends
+          return null;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [rateLimitCountdown]);
 
   const fetchScheduledTweets = async () => {
     try {
@@ -106,6 +218,7 @@ export default function TweetForm() {
     }
   };
 
+  // Update handleSubmit to handle recent tweets
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
@@ -150,8 +263,18 @@ export default function TweetForm() {
       
       if (response.status === 429) {
         const resetTime = data.resetTime;
-        const waitMinutes = Math.ceil((resetTime - Date.now()) / (60 * 1000));
-        setError(`Rate limit exceeded. Please wait ${waitMinutes} minutes before trying again.`);
+        const remainingTime = data.remainingTime || (resetTime - Date.now());
+        setRateLimitCountdown(remainingTime);
+        setResult({
+          success: false,
+          error: data.error || 'Rate limit exceeded',
+          resetTime: data.resetTime,
+          remainingTime: remainingTime,
+          remainingCount: data.remainingCount,
+          totalLimit: data.totalLimit
+        });
+        setError(`Rate limit reached. Please wait ${formatTimeRemaining(remainingTime)} before trying again.`);
+        fetchRecentTweets(); // Add this line to refresh tweets even during rate limit
         setIsSubmitting(false);
         return;
       }
@@ -169,8 +292,7 @@ export default function TweetForm() {
         if (data.scheduled) {
           fetchScheduledTweets();
         } else {
-          // Dispatch custom event for new tweet
-          window.dispatchEvent(new CustomEvent('newTweetPosted'));
+          fetchRecentTweets(); // Replace window.dispatchEvent with direct fetch
         }
       }
     } catch (error: any) {
@@ -187,6 +309,20 @@ export default function TweetForm() {
       .replace(/(https?:\/\/[^\s]+)/g, '<span class="text-blue-500">$1</span>')
       .replace(/@(\w+)/g, '<span class="text-blue-500">@$1</span>')
       .replace(/#(\w+)/g, '<span class="text-blue-500">#$1</span>');
+  };
+
+  // Helper function to format time remaining
+  const formatTimeRemaining = (milliseconds: number): string => {
+    if (milliseconds <= 0) return "0 seconds";
+    
+    const seconds = Math.ceil(milliseconds / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    
+    if (minutes > 0) {
+      return `${minutes}m ${remainingSeconds}s`;
+    }
+    return `${remainingSeconds}s`;
   };
 
   return (
@@ -267,6 +403,24 @@ export default function TweetForm() {
                 )}
               </div>
 
+              {(error || rateLimitCountdown) && (
+                <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                  <p className="text-yellow-800">
+                    {error}
+                    {rateLimitCountdown && rateLimitCountdown > 0 && (
+                      <span className="block mt-2 font-medium">
+                        Time remaining: {formatTimeRemaining(rateLimitCountdown)}
+                      </span>
+                    )}
+                    {result?.remainingCount !== undefined && result?.totalLimit !== undefined && (
+                      <span className="block mt-2">
+                        Tweets remaining: {result.remainingCount} of {result.totalLimit} in the current 15-minute window
+                      </span>
+                    )}
+                  </p>
+                </div>
+              )}
+
               <button
                 onClick={handleSubmit}
                 disabled={!message.trim() || isSubmitting}
@@ -308,35 +462,101 @@ export default function TweetForm() {
         )}
       </div>
 
-      {isAuthenticated && scheduledTweets.length > 0 && (
-        <div className="bg-white rounded-lg shadow-lg p-6 border border-gray-100">
-          <h2 className="text-2xl font-semibold text-gray-800 mb-6">Scheduled Tweets</h2>
-          <div className="space-y-4">
-            {scheduledTweets.map((tweet) => (
-              <div
-                key={tweet.id}
-                className="border border-gray-200 rounded-lg p-4 hover:border-gray-300 transition-colors"
-              >
-                <p className="text-gray-800">{tweet.message}</p>
-                <div className="mt-3 flex justify-between items-center text-sm">
-                  <span className="text-gray-500">
-                    Scheduled for: {new Date(tweet.scheduleTime).toLocaleString()}
-                  </span>
-                  <span className={`px-2 py-1 rounded-full text-xs font-medium ${
-                    tweet.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
-                    tweet.status === 'posted' ? 'bg-green-100 text-green-800' :
-                    'bg-red-100 text-red-800'
-                  }`}>
-                    {tweet.status.charAt(0).toUpperCase() + tweet.status.slice(1)}
-                  </span>
+      {isAuthenticated && (
+        <>
+          {/* Recent Tweets Section */}
+          <div className="bg-white rounded-lg shadow-lg p-6 border border-gray-100">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-2xl font-semibold text-gray-800">Recent Tweets</h2>
+              {tweetRateLimit && (
+                <div className="text-sm text-gray-600">
+                  {tweetRateLimit.remainingRequests !== undefined && (
+                    <span className="mr-4">
+                      Remaining refreshes: {tweetRateLimit.remainingRequests} of {tweetRateLimit.totalLimit}
+                    </span>
+                  )}
+                  {tweetRateLimit.windowReset && (
+                    <span>
+                      Resets in: {formatTimeRemaining(tweetRateLimit.windowReset - Date.now())}
+                    </span>
+                  )}
                 </div>
-                {tweet.error && (
-                  <p className="mt-2 text-sm text-red-600">{tweet.error}</p>
+              )}
+            </div>
+            
+            {tweetsError && (
+              <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                <p className="text-yellow-800">{tweetsError}</p>
+              </div>
+            )}
+
+            {tweetsLoading ? (
+              <div className="flex justify-center py-8">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {recentTweets.map((tweet) => (
+                  <div
+                    key={tweet.id}
+                    className="border border-gray-200 rounded-lg p-4 hover:border-gray-300 transition-colors"
+                  >
+                    <p className="text-gray-800">{tweet.text}</p>
+                    <div className="mt-3 flex justify-between items-center text-sm">
+                      <span className="text-gray-500">
+                        Posted: {new Date(tweet.created_at).toLocaleString()}
+                      </span>
+                      <div className="flex space-x-4">
+                        <span className="text-gray-600">
+                          ♥ {tweet.metrics?.like_count || 0}
+                        </span>
+                        <span className="text-gray-600">
+                          ↺ {tweet.metrics?.retweet_count || 0}
+                        </span>
+                        <span className="text-gray-600">
+                          💬 {tweet.metrics?.reply_count || 0}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {recentTweets.length === 0 && !tweetsError && (
+                  <p className="text-gray-500 text-center py-4">No recent tweets to display</p>
                 )}
               </div>
-            ))}
+            )}
           </div>
-        </div>
+
+          {/* Scheduled Tweets Section */}
+          <div className="bg-white rounded-lg shadow-lg p-6 border border-gray-100">
+            <h2 className="text-2xl font-semibold text-gray-800 mb-6">Scheduled Tweets</h2>
+            <div className="space-y-4">
+              {scheduledTweets.map((tweet) => (
+                <div
+                  key={tweet.id}
+                  className="border border-gray-200 rounded-lg p-4 hover:border-gray-300 transition-colors"
+                >
+                  <p className="text-gray-800">{tweet.message}</p>
+                  <div className="mt-3 flex justify-between items-center text-sm">
+                    <span className="text-gray-500">
+                      Scheduled for: {new Date(tweet.scheduleTime).toLocaleString()}
+                    </span>
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                      tweet.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                      tweet.status === 'posted' ? 'bg-green-100 text-green-800' :
+                      'bg-red-100 text-red-800'
+                    }`}>
+                      {tweet.status.charAt(0).toUpperCase() + tweet.status.slice(1)}
+                    </span>
+                  </div>
+                  {tweet.error && (
+                    <p className="mt-2 text-sm text-red-600">{tweet.error}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
       )}
     </div>
   );

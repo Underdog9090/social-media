@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 interface TweetAnalytics {
   id: string;
@@ -18,10 +18,32 @@ export default function Analytics() {
   const [analytics, setAnalytics] = useState<TweetAnalytics[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [showAnalytics, setShowAnalytics] = useState(false);
   const [lastRefreshTime, setLastRefreshTime] = useState<number>(0);
   const [rateLimitReset, setRateLimitReset] = useState<number | null>(null);
+  const [rateLimitCountdown, setRateLimitCountdown] = useState<number | null>(null);
+  const [remainingCount, setRemainingCount] = useState<number | null>(null);
+  const [totalLimit, setTotalLimit] = useState<number | null>(null);
   const REFRESH_COOLDOWN = 60 * 1000; // 1 minute cooldown
+
+  // Add countdown timer effect
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (rateLimitCountdown && rateLimitCountdown > 0) {
+      timer = setInterval(() => {
+        setRateLimitCountdown(prev => {
+          if (prev && prev > 0) {
+            return prev - 1000; // Decrease by 1 second (1000ms)
+          }
+          return null;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [rateLimitCountdown]);
 
   // Calculate total engagement metrics
   const totalEngagement = analytics.reduce((acc, tweet) => ({
@@ -79,15 +101,19 @@ export default function Analytics() {
   const fetchAnalytics = async () => {
     if (!canRefresh()) {
       const timeRemaining = rateLimitReset 
-        ? formatTimeRemaining(rateLimitReset - Date.now())
-        : formatTimeRemaining(REFRESH_COOLDOWN - (Date.now() - lastRefreshTime));
-      setError(`Please wait ${timeRemaining} before refreshing analytics`);
+        ? rateLimitReset - Date.now()
+        : REFRESH_COOLDOWN - (Date.now() - lastRefreshTime);
+      
+      setRateLimitCountdown(timeRemaining > 0 ? timeRemaining : null);
+      setError(`Please wait ${formatTimeRemaining(timeRemaining)} before refreshing analytics`);
+      setNotice(null);
       return;
     }
 
     try {
       setLoading(true);
       setError(null);
+      setNotice(null);
       const response = await fetch('http://localhost:3001/api/analytics', {
         credentials: 'include',
       });
@@ -96,9 +122,13 @@ export default function Analytics() {
       if (response.status === 429) {
         const data = await response.json();
         const resetTime = data.resetTime || (Date.now() + REFRESH_COOLDOWN);
+        const remainingTime = data.remainingTime || (resetTime - Date.now());
+        
         setRateLimitReset(resetTime);
-        const timeRemaining = formatTimeRemaining(resetTime - Date.now());
-        setError(`Rate limit reached. Please wait ${timeRemaining} before refreshing.`);
+        setRateLimitCountdown(remainingTime);
+        setRemainingCount(data.remainingCount || null);
+        setTotalLimit(data.totalLimit || null);
+        setError(`Rate limit reached. Please wait ${formatTimeRemaining(remainingTime)} before refreshing.`);
         return;
       }
 
@@ -108,12 +138,35 @@ export default function Analytics() {
         throw new Error(data.error || 'Failed to fetch analytics');
       }
 
-      setAnalytics(data.analytics);
+      // Check for notices in the response
+      if (data.notice) {
+        setNotice(data.notice);
+        
+        // If it's a rate limit notice, update the countdown
+        if (data.notice.includes('Rate limited')) {
+          const resetTime = data.resetTime || (Date.now() + REFRESH_COOLDOWN);
+          const remainingTime = data.remainingTime || (resetTime - Date.now());
+          
+          setRateLimitReset(resetTime);
+          setRateLimitCountdown(remainingTime);
+          setRemainingCount(data.remainingCount || null);
+          setTotalLimit(data.totalLimit || null);
+        }
+      } else {
+        setRateLimitReset(null);
+        setRateLimitCountdown(null);
+        setRemainingCount(null);
+        setTotalLimit(null);
+        setNotice(null);
+      }
+
+      setAnalytics(data.analytics || []);
       setShowAnalytics(true);
       setLastRefreshTime(Date.now());
-      setRateLimitReset(null);
+      setError(null);
     } catch (err: any) {
       setError(err.message || 'Failed to fetch analytics');
+      setNotice(null);
     } finally {
       setLoading(false);
     }
@@ -145,8 +198,33 @@ export default function Analytics() {
       </div>
 
       {error && (
-        <div className="mb-4 p-4 bg-red-50 text-red-700 rounded-lg">
-          {error}
+        <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+          <p className="text-yellow-800">
+            {error}
+            {rateLimitCountdown && rateLimitCountdown > 0 && (
+              <span className="block mt-2 font-medium">
+                Time remaining: {formatTimeRemaining(rateLimitCountdown)}
+              </span>
+            )}
+            {remainingCount !== null && totalLimit !== null && (
+              <span className="block mt-2">
+                Analytics requests remaining: {remainingCount} of {totalLimit} in the current 15-minute window
+              </span>
+            )}
+          </p>
+        </div>
+      )}
+
+      {notice && !error && (
+        <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+          <p className="text-blue-800">
+            {notice}
+            {rateLimitCountdown && rateLimitCountdown > 0 && notice.includes('Rate limited') && (
+              <span className="block mt-2 font-medium">
+                Time remaining: {formatTimeRemaining(rateLimitCountdown)}
+              </span>
+            )}
+          </p>
         </div>
       )}
 
